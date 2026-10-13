@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""Collect operator benchmarks and compare them with the previous CI result.
+
+Measuring and gating are separate steps, run by separate CI jobs.
+``record_benchmarks()`` runs inside pytest on a board and only writes down
+what it measured. ``check_baseline()`` (the ``check`` subcommand) compares
+those numbers against the published baseline and is the only thing that fails.
+
+The split exists so a reviewed change can be accepted quickly: the
+accept_espdl_ops_perf job republishes the baseline for the named operators,
+and re-running the gate is then a seconds-long job on a shared runner instead
+of a full re-measurement on hardware.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+# Schema v2 records the per-case minimum sample ("min_us") in addition to the
+# median/mean and gates the comparison on it: on-chip benchmark noise is
+# one-sided (it only ever adds time), so the minimum is the most stable
+# estimator across runs.
+# Schema v3 adds the DUT's factory eFuse MAC ("board") to the comparison key.
+# The CI target-test runners drive several boards of the same chip from one
+# host and hand out a free USB slot per job, so a test shard runs on an
+# arbitrary board every pipeline. Board-to-board spread is a systematic offset
+# of a few percent, so a chip-wide baseline compares measurements that were
+# never taken on the same hardware; one baseline per board removes that term.
+SCHEMA_VERSION = 3
+BENCH_PATTERN = re.compile(
+    r"BENCH name=(?P<name>\S+) "
+    r"(?:board=(?P<board>\S+) )?"
+    r"iters=(?P<iters>\d+) "
+    r"(?:min_us=(?P<min>[0-9]+(?:\.[0-9]+)?) )?"
+    r"median_us=(?P<median>[0-9]+(?:\.[0-9]+)?) "
+    r"mean_us=(?P<mean>[0-9]+(?:\.[0-9]+)?)"
+)
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+# Used when the DUT log carries no board=<mac> field (e.g. a firmware built
+# before schema v3). PERF_BOARD_ID can override it from the CI environment.
+UNKNOWN_BOARD = "unknown"
+
+# Update scope sentinel meaning "every operator", as opposed to a set of
+# operator names. Must stay in sync with perf_package.UPDATE_ALL_OPS.
+UPDATE_ALL_OPS = "*"
+LABEL_UPDATE = "update-perf-baseline"
+LABEL_UPDATE_SCOPED = LABEL_UPDATE + ":"
+
+# Per-target perf gate defaults. With the min-of-N measurement these values
+# were found stable enough for all three chips; keep them per-target anyway so
+# each chip can be returned independently. Any pipeline can override them via
+# GitLab pipeline/project CI/CD variables without a code change: a
+# <NAME>_<TARGET> variable (e.g. PERF_RELATIVE_THRESHOLD_PCT_ESP32) beats the
+# generic <NAME>, which beats these defaults.
+DEFAULT_RELATIVE_THRESHOLD_PCT = {"esp32": 40.0, "esp32s3": 9.0, "esp32p4": 6.0}
+DEFAULT_ABSOLUTE_FLOOR_US = {"esp32": 40.0, "esp32s3": 3.0, "esp32p4": 3.0}
+GENERIC_RELATIVE_THRESHOLD_PCT = 3.0
+GENERIC_ABSOLUTE_FLOOR_US = 3.0
+
+
+def _env_float(name, target, default):
+    """Resolve a perf gate threshold from environment variables.
+
+    Checks `<NAME>_<TARGET>` (e.g. PERF_RELATIVE_THRESHOLD_PCT_ESP32) first,
+    then the generic `<NAME>`, then falls back to `default`.
+    """
+    for key in ("{}_{}".format(name, target.upper()), name):
+        value = os.environ.get(key)
+        if value:
+            return float(value)
+    return default
+
+
+def default_board_id():
+    """Board identifier to use when the DUT log carries no board field."""
+    return os.environ.get("PERF_BOARD_ID", "").strip() or UNKNOWN_BOARD
+
+
+def parse_benchmarks(log):
+    """Return all machine-readable benchmark records from a DUT log."""
+    if isinstance(log, bytes):
+        log = log.decode("utf-8", errors="replace")
+    log = ANSI_ESCAPE_PATTERN.sub("", log)
+    fallback_board = default_board_id()
+    return [
+        {
+            "name": match.group("name"),
+            "board": match.group("board") or fallback_board,
+            "iters": int(match.group("iters")),
+            "min_us": float(match.group("min")) if match.group("min") else None,
+            "median_us": float(match.group("median")),
+            "mean_us": float(match.group("mean")),
+        }
+        for match in BENCH_PATTERN.finditer(log)
+    ]
+
+
+def _load_results(path):
+    path = Path(path)
+    if not path.is_file():
+        return {"schema_version": SCHEMA_VERSION, "results": []}
+    with path.open(encoding="utf-8") as result_file:
+        data = json.load(result_file)
+    if data.get("schema_version") != SCHEMA_VERSION:
+        raise RuntimeError(
+            "Unsupported performance result schema: {}".format(
+                data.get("schema_version")
+            )
+        )
+    if not isinstance(data.get("results"), list):
+        raise RuntimeError("Performance result file has no results array")
+    return data
+
+
+def _result_key(result):
+    return (
+        result["target"],
+        result["idf_version"],
+        result.get("board") or UNKNOWN_BOARD,
+        result["config"],
+        result["name"],
+    )
+
+
+def _case_key(result):
+    """Identify a test case regardless of which board measured it."""
+    return (
+        result["target"],
+        result["idf_version"],
+        result["config"],
+        result["name"],
+    )
+
+
+def _truthy(value):
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def update_baseline_scope():
+    """Operators whose baseline this pipeline may replace.
+
+    On a branch this only waives the gate; the baseline is written on master
+    alone. An MR normally speeds up a single operator, so a blanket waiver
+    would also cover whatever unrelated regression happens to share the
+    pipeline. Scope it with PERF_UPDATE_OPS=Conv,MatMul or with the MR label
+    "update-perf-baseline:Conv". The bare "update-perf-baseline" label (and
+    PERF_UPDATE_BASELINE=1) still means every operator.
+
+    Returns UPDATE_ALL_OPS, or a set of lower-cased operator names which is
+    empty when nothing may be updated.
+    """
+    labels = {
+        item.strip().lower()
+        for item in os.environ.get("CI_MERGE_REQUEST_LABELS", "").split(",")
+        if item.strip()
+    }
+    ops = {
+        item.strip().lower()
+        for item in os.environ.get("PERF_UPDATE_OPS", "").split(",")
+        if item.strip()
+    }
+    for label in labels:
+        if label.startswith(LABEL_UPDATE_SCOPED):
+            # A GitLab label list is itself comma separated, so one label can
+            # only name one operator; add several labels to cover several.
+            name = label[len(LABEL_UPDATE_SCOPED) :].strip()
+            if name:
+                ops.add(name)
+    if ops:
+        return ops
+    if _truthy(os.environ.get("PERF_UPDATE_BASELINE", "")) or LABEL_UPDATE in labels:
+        return UPDATE_ALL_OPS
+    return set()
+
+
+def update_allowed(scope, config):
+    """Whether an update scope from update_baseline_scope() covers `config`."""
+    if scope == UPDATE_ALL_OPS:
+        return True
+    name = str(config).lower()
+    if name in scope:
+        return True
+    # Conv_s8 / Conv_s16 / Conv_w8a16 inherit a bare "Conv" update scope.
+    return name.split("_", 1)[0] in scope
+
+
+def _compared_us(result, metric):
+    return float(result["min_us" if metric == "min" else "median_us"])
+
+
+def compare_result(
+    current,
+    baseline,
+    relative_threshold_pct,
+    absolute_floor_us,
+    allow_update=False,
+):
+    """Annotate one result and return an error message when it exceeds limits."""
+    if baseline is None:
+        current["status"] = "new"
+        return None
+
+    # Gate on the minimum sample when both records provide one: the minimum
+    # converges to the noise-free compute time, so min-to-min comparisons are
+    # much less sensitive to run-to-run timing fluctuation. Records from older
+    # baselines without min_us fall back to the median comparison.
+    metric = (
+        "min"
+        if current.get("min_us") is not None and baseline.get("min_us") is not None
+        else "median"
+    )
+    current_us = _compared_us(current, metric)
+    baseline_us = _compared_us(baseline, metric)
+    absolute_delta_us = current_us - baseline_us
+    if baseline_us == 0:
+        # Sub-microsecond op: the 1 us timer resolution quantizes the baseline
+        # minimum to 0 us, so the relative change is undefined. Enforce only
+        # the absolute floor here; a real slowdown still shows up as a jump of
+        # several us, which the floor still catches.
+        delta_pct = None
+        exceeds_relative = current_us > 0
+    else:
+        delta_pct = absolute_delta_us / baseline_us * 100.0
+        exceeds_relative = abs(delta_pct) > relative_threshold_pct
+
+    current.update(
+        {
+            "metric": metric,
+            "baseline_min_us": baseline.get("min_us"),
+            "baseline_median_us": baseline.get("median_us"),
+            "delta_us": round(absolute_delta_us, 3),
+            "delta_pct": round(delta_pct, 3) if delta_pct is not None else None,
+        }
+    )
+    exceeds_limit = exceeds_relative and abs(absolute_delta_us) > absolute_floor_us
+    if not exceeds_limit:
+        current["status"] = "pass"
+        return None
+    if allow_update:
+        current["status"] = "updated"
+        return None
+    current["status"] = "fail"
+    delta_text = "n/a" if delta_pct is None else "{:+.3f}%".format(delta_pct)
+    return (
+        "{name}: {metric} {current:.3f} us, baseline {baseline:.3f} us, "
+        "change {delta} (limit +/-{limit:.3f}%)"
+    ).format(
+        name=current["name"],
+        metric=metric,
+        current=current_us,
+        baseline=baseline_us,
+        delta=delta_text,
+        limit=relative_threshold_pct,
+    )
+
+
+def annotate_other_boards(current, baselines):
+    """Record how this measurement compares to the same case on other boards.
+
+    A case with no baseline for its own board cannot be gated, so it passes as
+    "new". Attaching the other boards' numbers keeps that measurement useful:
+    it is what quantifies the board-to-board spread while the per-board
+    baselines fill up over successive pipelines.
+    """
+    if not baselines:
+        return
+    metric = "min" if current.get("min_us") is not None else "median"
+    current_us = _compared_us(current, metric)
+    others = {}
+    for baseline in baselines:
+        if baseline.get("min_us") is None and metric == "min":
+            continue
+        board = baseline.get("board") or UNKNOWN_BOARD
+        others[board] = round(_compared_us(baseline, metric), 3)
+    if not others:
+        return
+    current["status"] = "new-board"
+    current["other_boards_us"] = others
+    if current_us > 0:
+        current["other_boards_delta_pct"] = {
+            board: round((current_us - value) / value * 100.0, 3)
+            for board, value in others.items()
+            if value > 0
+        }
+
+
+def _write_results(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8") as result_file:
+        json.dump(data, result_file, indent=2, sort_keys=True)
+        result_file.write("\n")
+    temporary_path.replace(path)
+
+
+def _write_markdown(path, data):
+    lines = [
+        "# ESP-DL operator performance comparison",
+        "",
+        "| Target | IDF | Board | Operator | Model | Metric | Current (us) | Baseline (us) | Delta | Status |",
+        "|---|---|---|---|---|---|---|---:|---:|---|",
+    ]
+    for result in sorted(data["results"], key=_result_key):
+        metric = result.get("metric", "median")
+        field = "min_us" if metric == "min" else "median_us"
+        baseline_field = "baseline_min_us" if metric == "min" else "baseline_median_us"
+        baseline = result.get(baseline_field)
+        delta = result.get("delta_pct")
+        lines.append(
+            "| {target} | {idf_version} | {board} | {config} | {name} | {metric} | "
+            "{current:.3f} | {baseline} | {delta} | {status} |".format(
+                target=result["target"],
+                idf_version=result["idf_version"],
+                board=result.get("board") or UNKNOWN_BOARD,
+                config=result["config"],
+                name=result["name"],
+                metric=metric,
+                current=result[field],
+                baseline="-" if baseline is None else "{:.3f}".format(baseline),
+                delta="-" if delta is None else "{:+.3f}%".format(delta),
+                status=result.get("status"),
+            )
+        )
+    lines.extend(_cross_board_section(data["results"]))
+    markdown_path = Path(path)
+    markdown_path.parent.mkdir(parents=True, exist_ok=True)
+    markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _cross_board_section(results):
+    """Markdown rows for cases whose baseline was recorded on another board."""
+    annotated = [result for result in results if result.get("other_boards_delta_pct")]
+    if not annotated:
+        return []
+    lines = [
+        "",
+        "## Same case on other boards",
+        "",
+        "These cases have no baseline for the board that measured them yet, so "
+        "they are not gated. The delta against the boards that do have a "
+        "baseline is the board-to-board spread.",
+        "",
+        "| Target | IDF | Board | Operator | Model | Current (us) | Other board | Baseline (us) | Delta |",
+        "|---|---|---|---|---|---:|---|---:|---:|",
+    ]
+    for result in sorted(annotated, key=_result_key):
+        metric = result.get("metric", "min" if result.get("min_us") else "median")
+        current_us = _compared_us(result, metric)
+        others = result["other_boards_us"]
+        for board, delta_pct in sorted(result["other_boards_delta_pct"].items()):
+            lines.append(
+                "| {target} | {idf_version} | {board} | {config} | {name} | "
+                "{current:.3f} | {other} | {other_us:.3f} | {delta:+.3f}% |".format(
+                    target=result["target"],
+                    idf_version=result["idf_version"],
+                    board=result.get("board") or UNKNOWN_BOARD,
+                    config=result["config"],
+                    name=result["name"],
+                    current=current_us,
+                    other=board,
+                    other_us=others[board],
+                    delta=delta_pct,
+                )
+            )
+    return lines
+
+
+def _read_dut_log(dut):
+    logfile = Path(dut.logfile)
+    if logfile.is_file():
+        content = logfile.read_bytes()
+        if BENCH_PATTERN.search(
+            ANSI_ESCAPE_PATTERN.sub("", content.decode("utf-8", errors="replace"))
+        ):
+            return content
+    return getattr(dut.pexpect_proc, "before", b"")
+
+
+def record_benchmarks(dut, config, target):
+    """Record one operator test's benchmarks.
+
+    Measuring and gating are deliberately separate steps. This one needs a
+    board and takes minutes; the gate is pure arithmetic over the recorded
+    numbers and runs in the check_espdl_ops_perf job. Accepting a reviewed
+    change therefore only has to re-run the cheap half.
+    """
+    benchmarks = parse_benchmarks(_read_dut_log(dut))
+    if not benchmarks:
+        raise AssertionError(
+            "No BENCH records were found in the DUT log {}".format(dut.logfile)
+        )
+
+    idf_version = os.environ.get("IDF_VERSION", "unknown")
+    result_path = Path(os.environ.get("PERF_RESULTS_FILE", "perf_results.json"))
+    # The board this shard landed on is decided by the runner's free USB slot,
+    # so log it (together with the runner slot) to make it possible to correlate
+    # a measurement with a physical DUT afterwards.
+    print(
+        "Measured on board(s) {} (runner {!r}, concurrent id {!r})".format(
+            ", ".join(sorted({benchmark["board"] for benchmark in benchmarks})),
+            os.environ.get("CI_RUNNER_DESCRIPTION", ""),
+            os.environ.get("CI_CONCURRENT_ID", ""),
+        )
+    )
+
+    results = _load_results(result_path)
+    results.update(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "commit_sha": os.environ.get("PIPELINE_COMMIT_SHA", ""),
+        }
+    )
+    current_by_key = {
+        _result_key(result): result for result in results.get("results", [])
+    }
+    for benchmark in benchmarks:
+        current = {
+            **benchmark,
+            "target": target,
+            "idf_version": idf_version,
+            "config": config,
+        }
+        key = _result_key(current)
+        if key in current_by_key:
+            # Multiple BENCH records share the same key (e.g. all cases exported
+            # with the same graph name). Never drop a case: keep every record and
+            # disambiguate the duplicates by suffixing their name.
+            suffix = 2
+            while True:
+                current["name"] = "{}#{}".format(benchmark["name"], suffix)
+                key = _result_key(current)
+                if key not in current_by_key:
+                    break
+                suffix += 1
+        current_by_key[key] = current
+
+    results["results"] = sorted(current_by_key.values(), key=_result_key)
+    _write_results(result_path, results)
+    print(
+        "Recorded {} benchmark(s) for {} into {}".format(
+            len(benchmarks), config, result_path
+        )
+    )
+
+
+def check_baseline(results_path, baseline_path, target, report_path):
+    """Gate one target's recorded measurements against its baseline.
+
+    Annotates every result in `results_path` in place with its delta and
+    status, writes the Markdown report, and returns the failure messages.
+    """
+    results = _load_results(results_path)
+    relative_threshold_pct = _env_float(
+        "PERF_RELATIVE_THRESHOLD_PCT",
+        target,
+        DEFAULT_RELATIVE_THRESHOLD_PCT.get(target, GENERIC_RELATIVE_THRESHOLD_PCT),
+    )
+    absolute_floor_us = _env_float(
+        "PERF_ABSOLUTE_FLOOR_US",
+        target,
+        DEFAULT_ABSOLUTE_FLOOR_US.get(target, GENERIC_ABSOLUTE_FLOOR_US),
+    )
+    update_scope = update_baseline_scope()
+    # Diagnostics go to stderr so that stdout stays usable as the machine
+    # readable answer, which is what the failing-ops subcommand returns.
+    print(
+        "Performance gate for target {}: change limit +/-{}% and +/-{}us".format(
+            target, relative_threshold_pct, absolute_floor_us
+        ),
+        file=sys.stderr,
+    )
+    print(
+        "Gate waived for: {} (a waiver only settles this check; the baseline "
+        "itself is only ever written on master)".format(
+            "every operator"
+            if update_scope == UPDATE_ALL_OPS
+            else ", ".join(sorted(update_scope)) or "<none>"
+        ),
+        file=sys.stderr,
+    )
+    results.update(
+        {
+            "relative_threshold_pct": relative_threshold_pct,
+            "absolute_floor_us": absolute_floor_us,
+            # What publish is allowed to replace. Recorded so the uploaded
+            # baseline says why an entry changed.
+            "update_baseline_ops": (
+                UPDATE_ALL_OPS
+                if update_scope == UPDATE_ALL_OPS
+                else sorted(update_scope)
+            ),
+        }
+    )
+
+    try:
+        baseline_results = _load_results(baseline_path)
+    except RuntimeError as error:
+        # A baseline recorded with an outdated schema (e.g. before the min_us
+        # measurement) cannot be compared against. Treat it as absent: every
+        # case is recorded as "new" and the publish job refreshes the baseline.
+        print(
+            "Ignoring performance baseline {}: {}".format(baseline_path, error),
+            file=sys.stderr,
+        )
+        baseline_results = {"schema_version": SCHEMA_VERSION, "results": []}
+    baseline_by_key = {
+        _result_key(result): result for result in baseline_results["results"]
+    }
+    # Same case measured on the other boards of this chip. Used to annotate a
+    # case that has no baseline for *this* board yet, which is how the per-board
+    # spread becomes visible in the diff report while the baselines fill up.
+    baseline_by_case = {}
+    for result in baseline_results["results"]:
+        baseline_by_case.setdefault(_case_key(result), []).append(result)
+
+    failures = []
+    for current in results["results"]:
+        key = _result_key(current)
+        baseline = baseline_by_key.get(key)
+        error = compare_result(
+            current,
+            baseline,
+            relative_threshold_pct,
+            absolute_floor_us,
+            allow_update=update_allowed(update_scope, current["config"]),
+        )
+        if error:
+            failures.append(error)
+        if baseline is None:
+            annotate_other_boards(current, baseline_by_case.get(_case_key(current)))
+
+    _write_results(results_path, results)
+    _write_markdown(report_path, results)
+    return failures
+
+
+def fetch_baseline(api_url, project_id, token, ref, job, artifact, output):
+    """Download the latest successful default-branch job artifact."""
+    quoted_project = urllib.parse.quote(str(project_id), safe="")
+    quoted_ref = urllib.parse.quote(ref, safe="")
+    quoted_artifact = "/".join(
+        urllib.parse.quote(part, safe="") for part in artifact.split("/")
+    )
+    query = urllib.parse.urlencode({"job": job})
+    url = (
+        "{api}/projects/{project}/jobs/artifacts/{ref}/raw/{artifact}?{query}"
+    ).format(
+        api=api_url.rstrip("/"),
+        project=quoted_project,
+        ref=quoted_ref,
+        artifact=quoted_artifact,
+        query=query,
+    )
+    request = urllib.request.Request(url, headers={"JOB-TOKEN": token})
+    output = Path(output)
+    try:
+        with urllib.request.urlopen(request) as response:
+            content = response.read()
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            output.unlink(missing_ok=True)
+            print("No performance baseline found for job {!r}".format(job))
+            return False
+        raise RuntimeError(
+            "Performance baseline download failed with HTTP {}".format(error.code)
+        ) from error
+
+    data = json.loads(content.decode("utf-8"))
+    if data.get("schema_version") != SCHEMA_VERSION:
+        output.unlink(missing_ok=True)
+        print(
+            "Downloaded performance baseline has an outdated schema ({!r}); "
+            "treating it as absent".format(data.get("schema_version"))
+        )
+        return False
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(content)
+    print("Downloaded performance baseline for job {!r}".format(job))
+    return True
+
+
+def _main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    fetch_parser = subparsers.add_parser("fetch")
+    fetch_parser.add_argument("--api-url", required=True)
+    fetch_parser.add_argument("--project-id", required=True)
+    fetch_parser.add_argument("--token", required=True)
+    fetch_parser.add_argument("--ref", required=True)
+    fetch_parser.add_argument("--job", required=True)
+    fetch_parser.add_argument("--artifact", default="perf_results.json")
+    fetch_parser.add_argument("--output", default="perf_baseline.json")
+
+    init_parser = subparsers.add_parser("init")
+    init_parser.add_argument("--output", default="perf_results.json")
+
+    for name, help_text in (
+        ("check", "Gate one target's aggregated measurements against its baseline."),
+        (
+            "failing-ops",
+            "Print the operators the gate rejects, as accept_espdl_ops_perf's "
+            "default scope. Always exits 0; the rejection itself is check's job "
+            "to report.",
+        ),
+    ):
+        gate_parser = subparsers.add_parser(name, help=help_text)
+        gate_parser.add_argument("--results", required=True)
+        gate_parser.add_argument("--baseline", required=True)
+        gate_parser.add_argument("--target", required=True)
+        gate_parser.add_argument("--report", required=True)
+
+    # Lets the publish job resolve the same scope the test job used, instead of
+    # reimplementing the label syntax in shell.
+    subparsers.add_parser("update-scope")
+
+    args = parser.parse_args()
+    if args.command == "check":
+        failures = check_baseline(args.results, args.baseline, args.target, args.report)
+        if failures:
+            print(
+                "Operator performance for {} changed beyond the allowed "
+                "range:\n{}".format(args.target, "\n".join(failures)),
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        print("Operator performance for {} is within range.".format(args.target))
+    elif args.command == "failing-ops":
+        check_baseline(args.results, args.baseline, args.target, args.report)
+        rejected = {
+            result["config"]
+            for result in _load_results(args.results)["results"]
+            if result.get("status") == "fail"
+        }
+        print(",".join(sorted(rejected)))
+    elif args.command == "update-scope":
+        scope = update_baseline_scope()
+        print(UPDATE_ALL_OPS if scope == UPDATE_ALL_OPS else ",".join(sorted(scope)))
+    elif args.command == "fetch":
+        fetch_baseline(
+            args.api_url,
+            args.project_id,
+            args.token,
+            args.ref,
+            args.job,
+            args.artifact,
+            args.output,
+        )
+    else:
+        _write_results(args.output, {"schema_version": SCHEMA_VERSION, "results": []})
+
+
+if __name__ == "__main__":
+    _main()

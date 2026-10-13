@@ -1,0 +1,185 @@
+import argparse
+import os
+
+import toml
+
+# Must match tools/ops_test/gen_test_cases.py: Conv is packed per quantization.
+_SPLIT_BY_QUANT_OPS = ("Conv",)
+_CFG_TO_PACKAGE_SUFFIX = {
+    "int8": "_s8",
+    "w8a8": "_s8",
+    "int16": "_s16",
+    "w16a16": "_s16",
+    "w8a16": "_w8a16",
+    "float32": "_f32",
+    "none": "_f32",
+}
+
+
+def package_names_for_op(op_type, op_cfg=None):
+    if op_type not in _SPLIT_BY_QUANT_OPS:
+        return [op_type]
+    quant_types = (op_cfg or {}).get("quant_type") or ["int8", "int16", "w8a16"]
+    names = []
+    seen = set()
+    for item in quant_types:
+        suffix = _CFG_TO_PACKAGE_SUFFIX.get(item)
+        if not suffix:
+            continue
+        name = op_type + suffix
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names or [op_type]
+
+
+# pytest-embedded's run_all_single_board_cases defaults to 30s. ESP32 C kernels
+# (especially Conv/Gemm) plus warmup/bench loops need much longer. The pytest
+# plugin default in conftest.py is 5 minutes and must stay above the Unity wait.
+# The esp32 timeout keeps headroom for the perf benchmark's 5 warmup + 12 timed
+# runs per model (1.7x the previous runs per model).
+UNITY_CASE_TIMEOUT_S = {
+    "esp32": 3600,
+}
+UNITY_CASE_TIMEOUT_DEFAULT_S = 600
+PYTEST_CASE_TIMEOUT_SLACK_S = 300
+
+
+def unity_timeout_for_target(target):
+    return UNITY_CASE_TIMEOUT_S.get(target, UNITY_CASE_TIMEOUT_DEFAULT_S)
+
+
+def pytest_timeout_for_target(target):
+    return unity_timeout_for_target(target) + PYTEST_CASE_TIMEOUT_SLACK_S
+
+
+PYTEST_TEMPLATE = """
+import pytest
+from pytest_embedded import Dut
+from tools.ops_test.benchmark.perf_benchmark import record_benchmarks
+
+
+@pytest.mark.target("{target}")
+@pytest.mark.env("{env}")
+@pytest.mark.timeout({pytest_timeout})
+@pytest.mark.parametrize(
+    "config",
+    {models},
+)
+def test_model_common(dut: Dut, config: str) -> None:
+    dut.run_all_single_board_cases(group="dl_model", timeout={unity_timeout})
+    record_benchmarks(dut, config, "{target}")
+"""
+
+
+def get_model_names(model_path):
+    if not model_path or not os.path.exists(model_path):
+        return []
+    models = [entry for entry in os.scandir(model_path) if entry.is_dir()]
+    if len(models) == 0:
+        return []
+
+    names = []
+    for mode in models:
+        names.append(os.path.basename(mode))
+
+    return names
+
+
+def write_pytest_script(pytest_file, target, env, models):
+    pytest_content = PYTEST_TEMPLATE.format(
+        target=target,
+        env=env,
+        models=str(models),
+        pytest_timeout=pytest_timeout_for_target(target),
+        unity_timeout=unity_timeout_for_target(target),
+    )
+    print(pytest_content)
+    with open(pytest_file, "w") as f:
+        f.write(pytest_content)
+
+
+def gen_pytest_script(model_path, pytest_file, target="esp32p4", env="esp32p4"):
+    # models = get_model_names(model_path)
+    target_model_path = os.path.join(model_path, target)
+    models = get_model_names(target_model_path)
+    if len(models) > 0:
+        print(models)
+        write_pytest_script(pytest_file, target, env, models)
+    else:
+        print(f"No model found in {model_path}")
+
+
+def gen_pytest_script_by_config(
+    config_file, pytest_file, target="esp32p4", env="esp32p4"
+):
+    # models = get_model_names(model_path)
+    op_test_config = toml.load(config_file)["ops_test"]
+
+    models = []
+    for op_type in op_test_config:
+        if op_type == "class_package":
+            continue
+        models.extend(package_names_for_op(op_type, op_test_config[op_type]))
+
+    if len(models) > 0:
+        print(models)
+        write_pytest_script(pytest_file, target, env, models)
+    else:
+        print(f"No model found in {config_file}")
+
+
+def gen_pytest_script_by_type(op_type, pytest_file, target="esp32p4", env="esp32p4"):
+    # models = get_model_names(model_path)
+    models = package_names_for_op(op_type)
+    if len(models) > 0:
+        print(models)
+        write_pytest_script(pytest_file, target, env, models)
+    else:
+        print(f"No model found in {model_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Generate script for operator test",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "-op", "--op_type", default=None, help="Type of operator to test."
+    )
+    parser.add_argument(
+        "-m", "--model_path", default=None, help="Paths of models to test."
+    )
+    parser.add_argument(
+        "-c", "--config", default=None, help="Test case config file path."
+    )
+    parser.add_argument(
+        "-o",
+        "--pytest_file",
+        default="pytest_op_test.py",
+        help="Path of pytest file to generate",
+    )
+    parser.add_argument(
+        "-t",
+        "--target",
+        default="all",
+        help='Build apps for given target. could pass "all" to get apps for all targets',
+    )
+    parser.add_argument(
+        "--env",
+        default="esp32p4",
+        type=str,
+        help="Envirenment to build apps.",
+    )
+    args = parser.parse_args()
+
+    if args.model_path:
+        gen_pytest_script(args.model_path, args.pytest_file, args.target, args.env)
+    elif args.config:
+        gen_pytest_script_by_config(
+            args.config, args.pytest_file, args.target, args.env
+        )
+    elif args.op_type:
+        gen_pytest_script_by_type(args.op_type, args.pytest_file, args.target, args.env)
+    else:
+        print("Please specify either model_path or config")
